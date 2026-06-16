@@ -46,14 +46,19 @@ https://aws.amazon.com/blogs/machine-learning/scalable-intelligent-document-proc
 
 5. bootstrap スタックをインストールするには、次のコマンドを実行します:
 	```
-	cdk bootstrap
+   uv run cdk bootstrap
 	```
 6. プロジェクトのルートディレクトリから、次のコマンドでスタックをデプロイします:
 	```
-	cdk deploy
+   uv run cdk deploy
 	```
 
    このリポジトリでは `cdk.json` の app 設定が `uv run python app.py` になっているため、`cdk synth` / `cdk deploy` 実行時には `uv` の仮想環境が使われます。
+
+   デプロイ前にテンプレートだけ確認したい場合は、次を実行してください。
+   ```
+   uv run cdk synth
+   ```
 
    AWS 上に作成される Lambda / Step Functions / SQS / CloudWatch Logs の主要リソース名は `cdk_stack_*` プレフィックスを使います。
 
@@ -123,6 +128,164 @@ https://aws.amazon.com/blogs/machine-learning/scalable-intelligent-document-proc
    - 変換済みファイルは `s3://<processing-bucket>/work/<pipelineVersion>/<hash_prefix>/<source_filename>/<document_id>/converted/` に保存され、その後の extractor はその S3 オブジェクトを読みます。
 
 7. `uploads/` プレフィックスと、S3 コンソールから `uploads/` 配下へブラウザアップロードするための最小 CORS ルールは、スタックが自動で整備します。追加の手動設定は不要です。
+
+## 動作方法
+
+### 1. デプロイ後の基本確認
+
+まず、スタックが見えることを確認します。
+
+```bash
+uv run cdk ls
+```
+
+このリポジトリの標準スタック名は `document-processing` です。
+
+次に、メイン S3 バケット名を確認します。`config.yml` で `s3BucketName` を固定していない場合は、CloudFormation から物理名を取得するのが確実です。
+
+```bash
+aws cloudformation describe-stack-resources \
+   --stack-name document-processing \
+   --query "StackResources[?ResourceType=='AWS::S3::Bucket'].PhysicalResourceId" \
+   --output text
+```
+
+以降、この値を `<processing-bucket>` として使います。
+
+### 2. サンプル入力を投入する
+
+このリポジトリには、すぐに試せるサンプル入力が入っています。
+
+- `sample-inputs/sample-birth-certificate-application.pdf`
+- `sample-inputs/word_extract_test_v1.docx`
+- `sample-inputs/テストケース.xlsx`
+- `sample-inputs/P6A2説明.pptx`
+
+S3 の `uploads/` プレフィックスへ配置すると、自動でパイプラインが起動します。
+
+```bash
+aws s3 cp sample-inputs/sample-birth-certificate-application.pdf \
+   s3://<processing-bucket>/uploads/sample-birth-certificate-application.pdf
+```
+
+Word / Excel / PowerPoint を試す場合も同様です。
+
+```bash
+aws s3 cp sample-inputs/word_extract_test_v1.docx s3://<processing-bucket>/uploads/word_extract_test_v1.docx
+aws s3 cp sample-inputs/テストケース.xlsx s3://<processing-bucket>/uploads/テストケース.xlsx
+aws s3 cp sample-inputs/P6A2説明.pptx s3://<processing-bucket>/uploads/P6A2説明.pptx
+```
+
+補足:
+
+- 同じ `uploads/` key へ再アップロードすると、新しい Step Functions 実行として再処理されます。
+- 対応拡張子は `pdf`, `doc`, `docx`, `xls`, `xlsx`, `ppt`, `pptx` です。
+
+### 3. 実行状態を確認する
+
+主な確認先は次の 3 つです。
+
+1. Step Functions
+    - ステートマシン名は `cdk_stack_stepfunction` です。
+    - 失敗時の分類は `UNSUPPORTED_FILE_TYPE`, `EXTRACT_FAILED`, `EMBEDDING_FAILED`, `INDEX_FAILED` です。
+2. CloudWatch Logs
+    - Lambda 関数名は `cdk_stack_*` 形式です。
+    - ログには本文ではなく `document_id`、件数、状態などのメタデータだけが出ます。
+3. S3 の `work/` 配下
+    - 抽出・enrichment・chunk・embedding の中間成果物が出力されます。
+
+実行履歴の一覧は AWS CLI からも見られます。
+
+```bash
+aws stepfunctions list-executions \
+   --state-machine-arn $(aws stepfunctions list-state-machines --query "stateMachines[?name=='cdk_stack_stepfunction'].stateMachineArn | [0]" --output text) \
+   --max-results 10
+```
+
+### 4. 出力アーティファクトを確認する
+
+正常時の主な出力は `work/{pipeline_version}/{hash_prefix}/{source_filename}/{document_id}/` 配下に作られます。
+
+### 4.1 出力結果の概要
+
+このパイプラインを 1 回実行すると、最終的には次の 3 層の結果が得られます。
+
+1. **構造化抽出結果**
+    - 元の PDF / Word / Excel / PowerPoint から、本文、表、画像参照などを `structured/objects.jsonl` に正規化して保存します。
+    - 画像がある場合は `structured/assets_manifest.json` に一覧を残します。
+    - 抽出処理全体のサマリは `structured/document_manifest.json` に残ります。
+2. **検索用の中間結果**
+    - `chunkbuild` が、抽出結果を検索しやすい単位へ再構成して `search/chunks/chunks.jsonl` を作ります。
+    - `chunkenrichment` が有効なら、summary / keywords / aliases / entities / `embedding_text` を追加した `search/chunks/enriched_chunks.jsonl` を派生生成します。
+    - 画像がある場合は `bedrockenrichment` が画像説明を追加し、`structured/enriched_objects.jsonl` を生成します。
+3. **ベクトル化・索引化結果**
+    - `embedding` が chunk ごとの埋め込みベクトルを `vectors/embeddings.jsonl` に保存します。
+    - `indexwriter` を有効化していれば、そのベクトルと chunk 本文が OpenSearch / Elastic Cloud に送られます。
+
+言い換えると、このリポジトリの出力は「抽出しただけの生データ」で終わらず、検索・RAG に使える chunk と embedding まで作る構成です。
+
+### 4.2 利用者視点で何が見えるか
+
+ファイル種別ごとに、概ね次のような結果が得られます。
+
+- PDF
+   - ページごとの本文テキストが抽出されます。
+   - 画像アセットは基本的に生成されず、主に本文中心の chunk / embedding が作られます。
+- Word (`.docx`, `.doc`)
+   - 段落、表、本文中画像が抽出されます。
+   - 表は row 配列として保持され、検索時にはテキスト化されます。
+- Excel (`.xlsx`, `.xls`)
+   - セル、推定された主テーブル、シート内画像が抽出されます。
+   - 検索時には table row block や sheet 単位の chunk に再構成されます。
+- PowerPoint (`.pptx`, `.ppt`)
+   - スライドごとのテキストと画像が抽出されます。
+   - 検索時には slide 単位の chunk にまとまります。
+
+### 4.3 成功時と部分成功時の違い
+
+- 必須ステップが成功した場合は、`objects.jsonl`、`chunks.jsonl`、`embeddings.jsonl` まで進みます。
+- `bedrockenrichment` や `chunkenrichment` は任意ステップなので、失敗しても raw artifact にフォールバックして後続へ進む場合があります。
+- その場合でも、`enrichment_manifest.json` や `search/chunks/chunk_enrichment_manifest.json` に失敗内容が残るため、「全文失敗」なのか「部分成功」なのかを判別できます。
+
+よく見るファイル:
+
+- `structured/objects.jsonl`
+- `structured/assets_manifest.json`
+- `structured/document_manifest.json`
+- `structured/enriched_objects.jsonl`
+- `search/chunks/chunks.jsonl`
+- `search/chunks/enriched_chunks.jsonl`
+- `vectors/embeddings.jsonl`
+
+一覧確認例:
+
+```bash
+aws s3 ls s3://<processing-bucket>/work/ --recursive
+```
+
+artifact の意味は [docs/output-artifacts.md](docs/output-artifacts.md) を参照してください。
+
+### 5. 失敗時の見方
+
+失敗時は、まず Step Functions の失敗カテゴリを見てから、`work/.../structured/` 配下の manifest を確認します。
+
+- `document_manifest.json`
+- `enrichment_manifest.json`
+- `search/chunks/chunk_enrichment_manifest.json`
+
+PDF は失敗時でも manifest を残します。`bedrockenrichment` と `chunkenrichment` は任意ステップなので、失敗しても raw artifact にフォールバックして後続へ進む場合があります。詳細は [docs/error-handling.md](docs/error-handling.md) を参照してください。
+
+### 6. ローカル検証コマンド
+
+コード変更後の最低限の確認コマンドは次です。
+
+```bash
+uv run python -m compileall app.py cdk_stack deploy_code
+uv run python -m unittest discover -s tests -t . -p "test_*.py"
+uv run cdk synth
+```
+
+テストは重要回帰だけを `tests/` に置いています。CDK / Lambda / 設定を変えたときは、少なくとも `compileall` と `cdk synth` を実行してください。
 ## クリーンアップ
 
 1. まず、作成された S3 バケットを完全に空にします。

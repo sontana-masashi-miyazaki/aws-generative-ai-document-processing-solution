@@ -111,6 +111,40 @@ Office extractor（DOCX / XLSX / PPTX）は主に `object_id` / `object_type` / 
 
 ### 3.3 image object
 
+XLSX では、cell / table に加えて、表の 1 行を検索向けに再構成した `row` object が追加されることがあります。
+
+```json
+{
+  "object_id": "sheet:1:table:primary:row:5",
+  "object_type": "row",
+  "title": "UI機能テスト",
+  "text": "Table: UI機能テスト\nRow: 5\nNo: 1\nテスト項目: スタート画面で開始",
+  "metadata": {
+    "source_type": "xlsx",
+    "table_id": "sheet:1:table:primary",
+    "table_title": "UI機能テスト",
+    "table_headers": ["No", "テスト項目", "期待結果", "開発者チェック / 合否", "開発者チェック / 備考"],
+    "source_cells": ["B5", "C5", "D5"],
+    "source_object_ids": [
+      "sheet:1:cell:B5",
+      "sheet:1:cell:C5",
+      "sheet:1:cell:D5"
+    ],
+    "fields": [
+      {"header": "No", "value": "1", "cell": "B5", "source_cell": "B5"}
+    ],
+    "loc": {
+      "xlsx": {
+        "sheet": "UI機能テスト",
+        "row": 5
+      }
+    }
+  }
+}
+```
+
+### 3.4 image object
+
 ```json
 {
   "object_id": "sheet:1:image:1",
@@ -141,7 +175,7 @@ Office extractor（DOCX / XLSX / PPTX）は主に `object_id` / `object_type` / 
 }
 ```
 
-### 3.4 契約
+### 3.5 契約
 
 - Office extractor の object は主に `object_id` / `object_type` / `metadata` を持つ
 - PDF extractor の object は現在 `id` / `type` / `loc` / `text` ベースで、Office extractor と完全な同一 shape ではない
@@ -151,6 +185,8 @@ Office extractor（DOCX / XLSX / PPTX）は主に `object_id` / `object_type` / 
 - `metadata.loc` の中身はフォーマットごとに異なる
 - xlsx の cell object は `loc.xlsx.row` / `loc.xlsx.col` を持つ
 - xlsx の table object は `metadata.headers` と `loc.xlsx.range` / `header_row` / `row_start` / `row_end` を持つ
+- xlsx の table object は複数 header row を検出した場合、cell 側に `metadata.header` と `metadata.table_role=header|data|noise` が付く
+- xlsx の row object は merged cell を補完した検索向け表現で、`metadata.source_cells` / `metadata.source_object_ids` / `metadata.fields` を持つ
 - xlsx の noise 列（`index`, `Unnamed:*`, 空 header）は `objects.jsonl` には残すが、対象 cell に `metadata.search_excluded=true` が付きうる
 - xlsx の image object の `loc.xlsx.anchor` は A1 形式文字列ではなく `from` / `to` を持つ辞書
 - image object は `metadata.s3_key` / `metadata.s3_uri` / `metadata.openxml_path` を持つ

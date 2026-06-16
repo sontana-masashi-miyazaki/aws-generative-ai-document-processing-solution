@@ -21,6 +21,10 @@ _CELL_REF_RE = re.compile(r"^([A-Z]+)([0-9]+)$")
 _NOISE_HEADER_RE = re.compile(r"^(?:unnamed(?::\s*\d+)?|index)$", re.IGNORECASE)
 
 
+def _local_name(tag: str) -> str:
+    return tag.split("}", 1)[-1] if isinstance(tag, str) else ""
+
+
 def _qname(ns: str, local: str) -> str:
     return f"{{{ns}}}{local}"
 
@@ -150,8 +154,14 @@ def _shared_strings(z: zipfile.ZipFile) -> List[str]:
 
     strings: List[str] = []
     for si in root.findall(".//{*}si"):
-        texts = [t.text or "" for t in si.findall(".//{*}t")]
-        strings.append("".join(texts))
+        parts: List[str] = []
+        for child in list(si):
+            child_name = _local_name(child.tag)
+            if child_name == "t":
+                parts.append(child.text or "")
+            elif child_name == "r":
+                parts.extend(t.text or "" for t in child.findall(".//{*}t"))
+        strings.append("".join(parts))
     return strings
 
 
@@ -165,8 +175,16 @@ def _cell_text(c: ET.Element, shared: List[str]) -> Optional[str]:
         return shared[idx]
 
     if t == "inlineStr":
-        texts = [t_el.text or "" for t_el in c.findall(".//{*}is//{*}t")]
-        s = "".join(texts).strip()
+        is_el = c.find("{*}is")
+        parts: List[str] = []
+        if is_el is not None:
+            for child in list(is_el):
+                child_name = _local_name(child.tag)
+                if child_name == "t":
+                    parts.append(child.text or "")
+                elif child_name == "r":
+                    parts.extend(t_el.text or "" for t_el in child.findall(".//{*}t"))
+        s = "".join(parts).strip()
         return s or None
 
     v = c.find("{*}v")
@@ -330,12 +348,15 @@ def _drawing_images(
     return images
 
 
-def _sheet_cells(z: zipfile.ZipFile, sheet_path: str, shared: List[str], max_cells: int) -> Tuple[List[Dict[str, str]], bool]:
+def _sheet_cells(
+    z: zipfile.ZipFile, sheet_path: str, shared: List[str], max_cells: int
+) -> Tuple[List[Dict[str, str]], List[Dict[str, str]], bool]:
     root = _read_xml(z, sheet_path)
     if root is None:
-        return [], False
+        return [], [], False
 
     cells: List[Dict[str, str]] = []
+    filled_cells: Dict[str, Dict[str, str]] = {}
     truncated = False
 
     for c in root.findall(".//{*}c"):
@@ -348,11 +369,50 @@ def _sheet_cells(z: zipfile.ZipFile, sheet_path: str, shared: List[str], max_cel
             continue
 
         cells.append({"ref": ref, "text": text})
+        filled_cells[ref] = {"ref": ref, "text": text, "source_ref": ref}
         if len(cells) >= max_cells:
             truncated = True
             break
 
-    return cells, truncated
+    for merge_el in root.findall(".//{*}mergeCell"):
+        merge_ref = merge_el.get("ref") or ""
+        start_ref, sep, end_ref = merge_ref.partition(":")
+        if not sep:
+            end_ref = start_ref
+        start_row, start_col, start_index = _parse_cell_ref(start_ref)
+        end_row, end_col, end_index = _parse_cell_ref(end_ref)
+        if (
+            start_row is None
+            or start_col is None
+            or start_index is None
+            or end_row is None
+            or end_col is None
+            or end_index is None
+        ):
+            continue
+        anchor = filled_cells.get(f"{start_col}{start_row}")
+        if anchor is None or not (anchor.get("text") or "").strip():
+            continue
+        row_start = min(start_row, end_row)
+        row_end = max(start_row, end_row)
+        col_start = min(start_index, end_index)
+        col_end = max(start_index, end_index)
+        for row_num in range(row_start, row_end + 1):
+            for col_index in range(col_start, col_end + 1):
+                col_label = _column_label(col_index)
+                if col_label is None:
+                    continue
+                ref = f"{col_label}{row_num}"
+                current = filled_cells.get(ref)
+                if current is None or not (current.get("text") or "").strip():
+                    filled_cells[ref] = {
+                        "ref": ref,
+                        "text": anchor["text"],
+                        "source_ref": anchor["source_ref"],
+                    }
+
+    filled = [filled_cells[ref] for ref in sorted(filled_cells.keys(), key=_cell_sort_key)]
+    return cells, filled, truncated
 
 
 def _column_index(col_label: str) -> Optional[int]:
@@ -364,6 +424,17 @@ def _column_index(col_label: str) -> Optional[int]:
     return value or None
 
 
+def _column_label(col_index: int) -> Optional[str]:
+    if not isinstance(col_index, int) or col_index <= 0:
+        return None
+    out: List[str] = []
+    value = col_index
+    while value > 0:
+        value, rem = divmod(value - 1, 26)
+        out.append(chr(65 + rem))
+    return "".join(reversed(out))
+
+
 def _parse_cell_ref(cell_ref: str) -> Tuple[Optional[int], Optional[str], Optional[int]]:
     if not isinstance(cell_ref, str):
         return None, None, None
@@ -372,6 +443,11 @@ def _parse_cell_ref(cell_ref: str) -> Tuple[Optional[int], Optional[str], Option
         return None, None, None
     col_label = m.group(1)
     return _safe_int(m.group(2)), col_label, _column_index(col_label)
+
+
+def _cell_sort_key(cell_ref: str) -> Tuple[int, int]:
+    row_num, col_label, col_index = _parse_cell_ref(cell_ref)
+    return (row_num or 0, col_index or 0)
 
 
 def _normalize_sheet_text(text: Optional[str]) -> str:
@@ -407,12 +483,52 @@ def _sheet_rows(cells: List[Dict[str, str]]) -> Dict[int, List[Dict[str, Any]]]:
                 "row": row_num,
                 "col_label": col_label,
                 "col_index": col_index,
+                "source_ref": cell.get("source_ref") or ref,
             }
         )
 
     for row_cells in rows.values():
         row_cells.sort(key=lambda item: item["col_index"])
     return rows
+
+
+def _build_header_map(rows: Dict[int, List[Dict[str, Any]]], header_rows: List[int]) -> Tuple[Dict[str, str], List[str]]:
+    if not header_rows:
+        return {}, []
+
+    header_cols = sorted(
+        {
+            cell["col_label"]
+            for row_num in header_rows
+            for cell in rows.get(row_num, [])
+            if _normalize_sheet_text(cell.get("text"))
+        },
+        key=lambda label: _column_index(label) or 0,
+    )
+    header_map: Dict[str, str] = {}
+    header_order: List[str] = []
+    seen: Dict[str, int] = {}
+
+    for col_label in header_cols:
+        parts: List[str] = []
+        for row_num in header_rows:
+            cell = next((item for item in rows.get(row_num, []) if item["col_label"] == col_label), None)
+            header_text = _normalize_sheet_text((cell or {}).get("text"))
+            if not header_text or _is_noise_header(header_text) or _is_numeric_text(header_text):
+                continue
+            if not parts or parts[-1] != header_text:
+                parts.append(header_text)
+        if not parts:
+            continue
+        header = " / ".join(parts)
+        count = seen.get(header, 0) + 1
+        seen[header] = count
+        if count > 1:
+            header = f"{header} [{count}]"
+        header_map[col_label] = header
+        header_order.append(col_label)
+
+    return header_map, header_order
 
 
 def _detect_primary_table(part_id: str, sheet_name: str, rows: Dict[int, List[Dict[str, Any]]]) -> Optional[Dict[str, Any]]:
@@ -422,68 +538,83 @@ def _detect_primary_table(part_id: str, sheet_name: str, rows: Dict[int, List[Di
     sorted_rows = sorted(rows.keys())
     best: Optional[Dict[str, Any]] = None
 
-    for row_num in sorted_rows[:50]:
-        row_cells = rows[row_num]
-        header_cells: List[Dict[str, Any]] = []
-        for cell in row_cells:
-            header_text = _normalize_sheet_text(cell.get("text"))
-            if not header_text or _is_noise_header(header_text) or _is_numeric_text(header_text):
-                continue
-            header_cells.append({**cell, "header": header_text})
-
-        if len(header_cells) < 2:
-            continue
-
-        active_cols = {cell["col_label"] for cell in header_cells}
-        data_rows: List[int] = []
-        blank_run = 0
-        for next_row in sorted_rows:
-            if next_row <= row_num:
-                continue
-            overlaps = [
-                cell
-                for cell in rows[next_row]
-                if cell["col_label"] in active_cols and _normalize_sheet_text(cell.get("text"))
-            ]
-            if overlaps:
-                data_rows.append(next_row)
-                blank_run = 0
+    for idx, row_num in enumerate(sorted_rows[:50]):
+        for depth in range(1, min(idx + 1, 3) + 1):
+            header_rows = sorted_rows[idx - depth + 1 : idx + 1]
+            if any((header_rows[pos] - header_rows[pos - 1]) > 1 for pos in range(1, len(header_rows))):
                 continue
 
-            blank_run += 1
-            if data_rows and blank_run >= 2:
-                break
+            header_map, header_order = _build_header_map(rows, header_rows)
+            if len(header_order) < 2:
+                continue
 
-        if not data_rows:
-            continue
+            if depth > 1:
+                max_subheader_cells = max(2, len(header_order) - 1)
+                row_text_counts = []
+                for header_candidate_row in header_rows:
+                    count = sum(
+                        1
+                        for cell in rows.get(header_candidate_row, [])
+                        if _normalize_sheet_text(cell.get("text"))
+                        and not _is_noise_header(cell.get("text"))
+                        and not _is_numeric_text(cell.get("text"))
+                    )
+                    row_text_counts.append(count)
+                if any(count >= max_subheader_cells for count in row_text_counts[1:]):
+                    continue
 
-        score = (len(header_cells) * 100) + (len(data_rows) * 10)
-        score += sum(1 for cell in header_cells if len(cell["header"]) <= 40)
+            active_cols = set(header_order)
+            data_rows: List[int] = []
+            blank_run = 0
+            for next_row in sorted_rows:
+                if next_row <= row_num:
+                    continue
+                overlaps = [
+                    cell
+                    for cell in rows[next_row]
+                    if cell["col_label"] in active_cols and _normalize_sheet_text(cell.get("text"))
+                ]
+                if overlaps:
+                    data_rows.append(next_row)
+                    blank_run = 0
+                    continue
 
-        if best is None or score > best["score"] or (score == best["score"] and row_num < best["header_row"]):
-            best = {
-                "score": score,
-                "header_row": row_num,
-                "header_cells": header_cells,
-                "data_rows": data_rows,
-                "row_end": data_rows[-1],
-            }
+                blank_run += 1
+                if data_rows and blank_run >= 2:
+                    break
+
+            if not data_rows:
+                continue
+
+            score = (len(header_order) * 100) + (len(data_rows) * 10) + (depth * 5)
+            score += sum(1 for header in header_map.values() if len(header) <= 60)
+            score += sum(25 for header in header_map.values() if " / " in header)
+
+            if best is None or score > best["score"] or (score == best["score"] and row_num < best["header_row"]):
+                best = {
+                    "score": score,
+                    "header_row": row_num,
+                    "header_rows": header_rows,
+                    "header_map": header_map,
+                    "header_order": header_order,
+                    "headers": [header_map[col_label] for col_label in header_order],
+                    "data_rows": data_rows,
+                    "row_end": data_rows[-1],
+                }
 
     if best is None:
         return None
 
     header_row = best["header_row"]
-    header_cells = best["header_cells"]
-    header_cells_by_col = {cell["col_label"]: cell for cell in header_cells}
-    all_header_cells = rows.get(header_row, [])
+    all_header_cells = [cell for row_num in best["header_rows"] for cell in rows.get(row_num, [])]
     noise_columns = [
         cell["col_label"]
         for cell in all_header_cells
-        if cell["col_label"] not in header_cells_by_col
+        if cell["col_label"] not in best["header_map"]
     ]
 
-    first_col = all_header_cells[0]["col_label"] if all_header_cells else header_cells[0]["col_label"]
-    last_col = all_header_cells[-1]["col_label"] if all_header_cells else header_cells[-1]["col_label"]
+    first_col = best["header_order"][0]
+    last_col = best["header_order"][-1]
     row_start = best["data_rows"][0]
     row_end = best["row_end"]
 
@@ -491,9 +622,10 @@ def _detect_primary_table(part_id: str, sheet_name: str, rows: Dict[int, List[Di
         "table_id": f"{part_id}:table:primary",
         "title": sheet_name,
         "header_row": header_row,
-        "header_map": {cell["col_label"]: cell["header"] for cell in header_cells},
-        "header_order": [cell["col_label"] for cell in header_cells],
-        "headers": [cell["header"] for cell in header_cells],
+        "header_rows": best["header_rows"],
+        "header_map": best["header_map"],
+        "header_order": best["header_order"],
+        "headers": best["headers"],
         "data_rows": best["data_rows"],
         "data_rows_set": set(best["data_rows"]),
         "row_start": row_start,
@@ -501,6 +633,69 @@ def _detect_primary_table(part_id: str, sheet_name: str, rows: Dict[int, List[Di
         "range": f"{first_col}{header_row}:{last_col}{row_end}",
         "noise_columns_set": set(noise_columns),
     }
+
+
+def _build_table_row_objects(
+    part_id: str,
+    sheet_name: str,
+    table: Dict[str, Any],
+    rows: Dict[int, List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    by_row = {row_num: {cell["col_label"]: cell for cell in rows.get(row_num, [])} for row_num in table["data_rows"]}
+    row_objects: List[Dict[str, Any]] = []
+
+    for row_num in table["data_rows"]:
+        fields: List[Dict[str, Any]] = []
+        source_cells: List[str] = []
+        source_object_ids: List[str] = []
+        for col_label in table["header_order"]:
+            cell = by_row.get(row_num, {}).get(col_label)
+            if cell is None:
+                continue
+            value = _normalize_sheet_text(cell.get("text"))
+            if not value:
+                continue
+            header = table["header_map"].get(col_label)
+            source_ref = cell.get("source_ref") or cell.get("ref")
+            if isinstance(source_ref, str) and source_ref and source_ref not in source_cells:
+                source_cells.append(source_ref)
+                source_object_ids.append(f"{part_id}:cell:{source_ref}")
+            fields.append(
+                {
+                    "header": header,
+                    "value": value,
+                    "cell": cell.get("ref"),
+                    "source_cell": source_ref,
+                }
+            )
+
+        if not fields:
+            continue
+
+        row_text = "\n".join(
+            [f"Table: {table['title']}", f"Row: {row_num}"]
+            + [f"{field['header']}: {field['value']}" for field in fields if field.get("header")]
+        )
+        row_objects.append(
+            {
+                "id": f"{table['table_id']}:row:{row_num}",
+                "type": "row",
+                "part_id": part_id,
+                "title": table["title"],
+                "text": row_text,
+                "loc": {"xlsx": {"sheet": sheet_name, "row": row_num}},
+                "metadata_extra": {
+                    "table_id": table["table_id"],
+                    "table_title": table["title"],
+                    "table_headers": table["headers"],
+                    "source_cells": source_cells,
+                    "source_object_ids": source_object_ids,
+                    "fields": fields,
+                },
+            }
+        )
+
+    return row_objects
 
 
 def lambda_handler(event, context):
@@ -538,18 +733,21 @@ def lambda_handler(event, context):
             sheet_name = sh.get("name")
             sheet_path = sh.get("path")
 
-            cells, _truncated = _sheet_cells(z, sheet_path, shared, max_cells=max_cells)
+            cells, filled_cells, _truncated = _sheet_cells(z, sheet_path, shared, max_cells=max_cells)
             sheet_rows = _sheet_rows(cells)
-            table = _detect_primary_table(part_id, sheet_name, sheet_rows)
+            filled_rows = _sheet_rows(filled_cells)
+            table = _detect_primary_table(part_id, sheet_name, filled_rows)
 
             if table is not None:
                 order += 1
-                table_source_ids = [
-                    f"{part_id}:cell:{cell['ref']}"
-                    for row_num in table["data_rows"]
-                    for cell in sheet_rows.get(row_num, [])
-                    if cell["col_label"] in table["header_map"]
-                ]
+                table_source_ids: List[str] = []
+                for row_num in table["data_rows"]:
+                    for cell in filled_rows.get(row_num, []):
+                        if cell["col_label"] not in table["header_map"]:
+                            continue
+                        source_id = f"{part_id}:cell:{cell.get('source_ref') or cell['ref']}"
+                        if source_id not in table_source_ids:
+                            table_source_ids.append(source_id)
                 elements.append(
                     {
                         "id": table["table_id"],
@@ -573,6 +771,10 @@ def lambda_handler(event, context):
                         },
                     }
                 )
+                for row_object in _build_table_row_objects(part_id, sheet_name, table, filled_rows):
+                    order += 1
+                    row_object["order"] = order
+                    elements.append(row_object)
 
             for c in cells:
                 text = (c.get("text") or "").strip()
@@ -591,7 +793,7 @@ def lambda_handler(event, context):
                             "header_row": table["header_row"],
                         }
                     )
-                    if row_num == table["header_row"] and col_label in table["header_map"]:
+                    if row_num in table["header_rows"] and col_label in table["header_map"]:
                         metadata_extra.update(
                             {
                                 "table_role": "header",
@@ -672,8 +874,10 @@ def lambda_handler(event, context):
         if isinstance(el.get("metadata_extra"), dict):
             rec["metadata"].update(el["metadata_extra"])
 
-        if el.get("type") in {"text", "cell", "table"}:
+        if el.get("type") in {"text", "cell", "table", "row"}:
             rec["text"] = el.get("text")
+            if el.get("title"):
+                rec["title"] = el.get("title")
         elif el.get("type") == "image":
             rec["metadata"].update(
                 {

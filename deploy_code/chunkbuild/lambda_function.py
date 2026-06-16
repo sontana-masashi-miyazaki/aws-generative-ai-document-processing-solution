@@ -356,6 +356,22 @@ def _build_xlsx_segments(
         bucket = sheets.setdefault(sheet_name, {"table_rows": {}, "loose_rows": {}, "images": [], "sheet_objects": []})
         bucket["sheet_objects"].append(obj)
 
+        if obj.get("type") == "row" and obj.get("text"):
+            row_num = _nested_loc(meta, "xlsx", "row")
+            table_id = meta.get("table_id")
+            if isinstance(table_id, str) and table_id and isinstance(row_num, int) and row_num > 0:
+                table_bucket = bucket["table_rows"].setdefault(
+                    table_id,
+                    {
+                        "title": meta.get("table_title") or obj.get("title") or sheet_name,
+                        "headers": meta.get("table_headers") or [],
+                        "rows": {},
+                        "row_objects": {},
+                    },
+                )
+                table_bucket.setdefault("row_objects", {})[row_num] = obj
+                continue
+
         if obj.get("type") in {"text", "cell"} and obj.get("text"):
             if meta.get("search_excluded"):
                 continue
@@ -391,6 +407,7 @@ def _build_xlsx_segments(
                         "title": meta.get("table_title") or sheet_name,
                         "headers": meta.get("table_headers") or [],
                         "rows": {},
+                        "row_objects": {},
                     },
                 )
                 table_bucket["rows"].setdefault(row_num, []).append((col_index, header_text.strip(), obj["text"], obj))
@@ -417,21 +434,31 @@ def _build_xlsx_segments(
     segments: List[Dict[str, Any]] = []
     for sheet_name, sheet in sheets.items():
         for table_id, table in sheet["table_rows"].items():
-            row_numbers = sorted(r for r in table["rows"].keys() if r > 0)
+            row_objects = table.get("row_objects") or {}
+            row_numbers = sorted(
+                {r for r in table["rows"].keys() if r > 0}
+                | {r for r in row_objects.keys() if isinstance(r, int) and r > 0}
+            )
             lines: List[str] = []
             line_objects: List[List[Dict[str, Any]]] = []
             row_sequence: List[int] = []
             for row_num in row_numbers:
-                cells = sorted(table["rows"][row_num], key=lambda item: item[0])
-                rendered = "\n".join(
-                    f"{header}: {text}"
-                    for _col, header, text, _obj in cells
-                    if isinstance(header, str) and header.strip() and isinstance(text, str) and text.strip()
-                )
+                row_obj = row_objects.get(row_num)
+                if row_obj is not None:
+                    rendered = (row_obj.get("text") or "").strip()
+                    objects = [row_obj]
+                else:
+                    cells = sorted(table["rows"].get(row_num, []), key=lambda item: item[0])
+                    rendered = "\n".join(
+                        f"{header}: {text}"
+                        for _col, header, text, _obj in cells
+                        if isinstance(header, str) and header.strip() and isinstance(text, str) and text.strip()
+                    )
+                    objects = [obj for _col, _header, _text, obj in cells]
                 if not rendered:
                     continue
                 lines.append(rendered)
-                line_objects.append([obj for _col, _header, _text, obj in cells])
+                line_objects.append(objects)
                 row_sequence.append(row_num)
 
             if not lines:
