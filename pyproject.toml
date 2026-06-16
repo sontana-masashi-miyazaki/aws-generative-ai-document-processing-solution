@@ -1,0 +1,14 @@
+[project]
+name = "aws-generative-ai-document-processing-solution"
+version = "0.0.1"
+description = "AWS CDK app for the Bedrock document processing solution"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "appdirs==1.4.3",
+    "aws-cdk-lib==2.142.1",
+    "boto3>=1.43.9",
+    "cdk-nag>=2.18.44",
+    "constructs>=10.0.0,<11.0.0",
+    "PyYAML>=6.0.2,<7.0.0",
+]

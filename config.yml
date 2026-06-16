@@ -1,0 +1,34 @@
+# Root deployment settings for the CDK app.
+# Edit this file, then run `cdk synth` or `cdk deploy`.
+
+pipelineVersion: pipeline_v1
+
+# Set one or both when they resolve to the same VPC.
+lambdaVpcId: null
+lambdaVpcName: null
+lambdaSubnetIds: []
+lambdaSecurityGroupIds: []
+
+# Leave null to use the built-in default behavior:
+# true when a VPC is configured and no security groups are supplied, otherwise false.
+createLambdaSecurityGroup: null
+lambdaAllowAllOutbound: false
+
+# Optional fixed name for the main processing bucket.
+s3BucketName: sontana-document-test-bucket
+
+sofficeBinary: /opt/libreoffice/program/soffice
+bedrockImageModelId: global.amazon.nova-2-lite-v1:0
+embeddingModelId: amazon.titan-embed-text-v2:0
+embeddingDimensions: 1024
+chunkEnrichmentModelId: global.amazon.nova-2-lite-v1:0
+statusTableName: null
+
+# Search backend settings:
+# - none: disable indexing
+# - aws-opensearch: use SigV4 against an AWS-managed domain
+# - elastic-cloud: use an API key stored in Secrets Manager
+searchBackend: none
+searchEndpoint: null
+searchIndex: null
+searchApiKeySecretArn: null

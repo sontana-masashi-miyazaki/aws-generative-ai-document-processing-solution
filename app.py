@@ -1,21 +1,33 @@
 #!/usr/bin/env python3
 import os
+from pathlib import Path
 
 import aws_cdk as cdk
 
-from aws_cdk import (
-    Aspects,
-)
-from cdk_nag import AwsSolutionsChecks 
-from multipagepdfa2i.multipagepdfa2i_stack import (
-    Multipagepdfa2IStack,
+from cdk_stack import (
+    CONFIG_FILE_NAME,
+    DocumentProcessingStack,
+    load_config_file,
+    requires_cdk_environment,
 )
 
+
+config_path = Path(__file__).resolve().with_name(CONFIG_FILE_NAME)
+deployment_settings = load_config_file(config_path)
 
 app = cdk.App()
-Multipagepdfa2IStack(
+stack_kwargs = {}
+
+if requires_cdk_environment(deployment_settings):
+    stack_kwargs["env"] = cdk.Environment(
+        account=os.getenv("CDK_DEFAULT_ACCOUNT"),
+        region=os.getenv("CDK_DEFAULT_REGION"),
+    )
+
+DocumentProcessingStack(
     app,
-    "multipagepdfa2i",
+    "document-processing",
+    deployment_settings=deployment_settings,
     # If you don't specify 'env', this stack will be environment-agnostic.
     # Account/Region-dependent features and context lookups will not work,
     # but a single synthesized template can be deployed anywhere.
@@ -26,9 +38,7 @@ Multipagepdfa2IStack(
     # want to deploy the stack to. */
     # env=cdk.Environment(account='123456789012', region='us-east-1'),
     # For more information, see https://docs.aws.amazon.com/cdk/latest/guide/environments.html
+    **stack_kwargs,
 )
-
-## Add aspects
-#Aspects.of(app).add(AwsSolutionsChecks(verbose=True))
 
 app.synth()
